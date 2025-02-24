@@ -1,7 +1,4 @@
-
-# --- Additional Functionality for Users & Managers ---
-
-# Function to save user edits to the approval table
+# --- Function to Save User Edits ---
 def save_user_edits():
     edited_data = {}
 
@@ -16,7 +13,8 @@ def save_user_edits():
             account=sf_account,
             warehouse=sf_warehouse,
             database=sf_database,
-            schema=sf_schema)
+            schema=sf_schema
+        )
         
         cursor = conn.cursor()
         
@@ -34,7 +32,7 @@ def save_user_edits():
                     VALUES ('{param_name}', '{old_value}', '{new_value}', CURRENT_USER(), CURRENT_TIMESTAMP())
                 """)
 
-                # Update main table status
+                # Update main table status to "Pending Approval"
                 cursor.execute(f"""
                     UPDATE ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT 
                     SET STATUS = 'Pending Approval'
@@ -51,67 +49,76 @@ def save_user_edits():
             cursor.close()
             conn.close()
 
-# Function for managers to approve changes
+# --- Function for Managers to Approve Changes ---
 def approve_changes():
-    approve_query = """
-    SELECT a.*, b.PARAM_VALUE AS OLD_PARAM_VALUE 
-    FROM ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT_APPROVE a
-    JOIN ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT b
-    ON a.PARAM_NAME = b.PARAM_NAME
-    """
-    
-    df_approve = fetch_data(approve_query)
-    
-    if df_approve.empty:
-        st.info("No changes pending approval.")
-    else:
-        st.dataframe(df_approve)
+    conn = snowflake.connector.connect(
+        user=sf_user,
+        password=sf_password,
+        account=sf_account,
+        warehouse=sf_warehouse,
+        database=sf_database,
+        schema=sf_schema
+    )
 
-        if st.button("Approve Changes"):
-            conn = snowflake.connector.connect(
-                user=sf_user,
-                password=sf_password,
-                account=sf_account,
-                warehouse=sf_warehouse,
-                database=sf_database,
-                schema=sf_schema)
-            
-            cursor = conn.cursor()
-            
-            try:
+    cursor = conn.cursor()
+    
+    try:
+        # Fetch pending approvals and join with old values
+        approve_query = """
+        SELECT a.*, b.PARAM_VALUE AS OLD_PARAM_VALUE 
+        FROM ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT_APPROVE a
+        JOIN ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT b
+        ON a.PARAM_NAME = b.PARAM_NAME
+        """
+        
+        cursor.execute(approve_query)
+        approve_data = cursor.fetchall()
+        columns = [desc[0] for desc in cursor.description]
+        df_approve = pd.DataFrame(approve_data, columns=columns)
+        
+        if df_approve.empty:
+            st.info("No changes pending approval.")
+        else:
+            st.dataframe(df_approve)
+
+            if st.button("Approve Changes"):
                 for _, row in df_approve.iterrows():
-                    # Update main table with approved values
-                    cursor.execute(f"""
-                        UPDATE ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT
-                        SET PARAM_VALUE = '{row['PARAM_VALUE']}', STATUS = 'Approved'
-                        WHERE PARAM_NAME = '{row['PARAM_NAME']}'
-                    """)
+                    try:
+                        # Update main table with approved values
+                        cursor.execute(f"""
+                            UPDATE ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT
+                            SET PARAM_VALUE = '{row['PARAM_VALUE']}', STATUS = 'Approved'
+                            WHERE PARAM_NAME = '{row['PARAM_NAME']}'
+                        """)
 
-                    # Insert record into history table
-                    cursor.execute(f"""
-                        INSERT INTO ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_HISTORY
-                        (PARAM_NAME, OLD_VALUE, NEW_VALUE, EDITED_BY, EDITED_TIMESTAMP, APPROVED_BY, APPROVED_TIMESTAMP)
-                        VALUES ('{row['PARAM_NAME']}', '{row['OLD_PARAM_VALUE']}', '{row['PARAM_VALUE']}', 
-                                '{row['EDITED_BY']}', '{row['EDITED_TIMESTAMP']}', CURRENT_USER(), CURRENT_TIMESTAMP())
-                    """)
+                        # Insert record into history table
+                        cursor.execute(f"""
+                            INSERT INTO ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_HISTORY
+                            (PARAM_NAME, OLD_VALUE, NEW_VALUE, EDITED_BY, EDITED_TIMESTAMP, APPROVED_BY, APPROVED_TIMESTAMP)
+                            VALUES ('{row['PARAM_NAME']}', '{row['OLD_PARAM_VALUE']}', '{row['PARAM_VALUE']}', 
+                                    '{row['EDITED_BY']}', '{row['EDITED_TIMESTAMP']}', CURRENT_USER(), CURRENT_TIMESTAMP())
+                        """)
 
-                    # Remove record from approval table
-                    cursor.execute(f"""
-                        DELETE FROM ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT_APPROVE
-                        WHERE PARAM_NAME = '{row['PARAM_NAME']}'
-                    """)
+                        # Remove record from approval table
+                        cursor.execute(f"""
+                            DELETE FROM ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT_APPROVE
+                            WHERE PARAM_NAME = '{row['PARAM_NAME']}'
+                        """)
+
+                    except Exception as e:
+                        st.error(f"Error approving changes: {e}")
 
                 conn.commit()
                 st.success("Changes approved and updated successfully!")
 
-            except Exception as e:
-                st.error(f"Error approving changes: {e}")
+    except Exception as e:
+        st.error(f"Error fetching approval data: {e}")
 
-            finally:
-                cursor.close()
-                conn.close()
+    finally:
+        cursor.close()
+        conn.close()
 
-# Show buttons based on role
+# --- Show Buttons Based on User Role ---
 if user_role == 'ACT_DEV_DISCOUNTRATE_DB_USER_ROLE':
     save_user_edits()
 elif user_role == 'ACCOUNTADMIN':
