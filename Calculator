@@ -2,112 +2,175 @@ import streamlit as st
 import snowflake.connector
 import pandas as pd
 
-# --- Snowflake Connection Setup ---
+# --- Load Snowflake Credentials Securely ---
+st.title("Smith-Wilson UFR Calculation Tool")
+
+try:
+    # Fetch credentials from Streamlit secrets
+    SF_CREDENTIALS = st.secrets["snowflake"]
+except Exception as e:
+    st.error("Error loading Snowflake credentials. Make sure your secrets are set up!")
+    st.stop()
+
+# --- Function to Connect to Snowflake ---
 def get_snowflake_connection():
+    """Establish a connection to Snowflake using credentials."""
     try:
         conn = snowflake.connector.connect(
-            user=st.secrets["snowflake"]["user"],
-            password=st.secrets["snowflake"]["password"],
-            account=st.secrets["snowflake"]["account"],
-            warehouse=st.secrets["snowflake"]["warehouse"],
-            database=st.secrets["snowflake"]["database"],
-            schema=st.secrets["snowflake"]["schema"]
+            user=SF_CREDENTIALS["user"],
+            password=SF_CREDENTIALS["password"],
+            account=SF_CREDENTIALS["account"],
+            warehouse=SF_CREDENTIALS["warehouse"],
+            database=SF_CREDENTIALS["database"],
+            schema=SF_CREDENTIALS["schema"]
         )
         return conn
     except Exception as e:
         st.error(f"Error connecting to Snowflake: {e}")
         return None
 
-# --- Fetch Data from Snowflake ---
+# --- Function to Fetch Data from Snowflake ---
 def fetch_data(query):
+    """Fetch data from Snowflake and return a pandas DataFrame."""
     conn = get_snowflake_connection()
-    if conn:
-        try:
-            cursor = conn.cursor()
-            cursor.execute(query)
-            data = cursor.fetchall()
-            columns = [desc[0] for desc in cursor.description]
-            cursor.close()
-            conn.close()
-            return pd.DataFrame(data, columns=columns)
-        except Exception as e:
-            st.error(f"Error fetching data: {e}")
-    return pd.DataFrame()
+    if conn is None:
+        return pd.DataFrame()  # Return empty DataFrame if connection fails
+
+    try:
+        cursor = conn.cursor()
+        cursor.execute(query)
+        data = cursor.fetchall()
+        columns = [desc[0] for desc in cursor.description]
+        df = pd.DataFrame(data, columns=columns)
+    except Exception as e:
+        st.error(f"Error fetching data: {e}")
+        df = pd.DataFrame()  # Return empty DataFrame on error
+    finally:
+        cursor.close()
+        conn.close()
+
+    return df
 
 # --- Get User Role ---
 def get_user_role():
-    df = fetch_data("SELECT CURRENT_ROLE()")
-    return df.iloc[0, 0] if not df.empty else None
+    """Fetch the current user's role from Snowflake."""
+    role_df = fetch_data("SELECT CURRENT_ROLE()")
+    return role_df.iloc[0, 0] if not role_df.empty else "Unknown Role"
 
-# --- Get Snowflake User ---
+# --- Get Current Snowflake User ---
 def get_snowflake_user():
-    df = fetch_data("SELECT CURRENT_USER()")
-    return df.iloc[0, 0] if not df.empty else None
+    """Fetch the currently logged-in Snowflake user."""
+    user_df = fetch_data("SELECT CURRENT_USER()")
+    return user_df.iloc[0, 0] if not user_df.empty else "Unknown User"
 
-# --- Main UI ---
-st.title("Smith-Wilson UFR Calculation")
+# --- Load and Display Data ---
+st.subheader("Discount Rate User Input Data")
 
-df = fetch_data("""
-    SELECT * FROM ACT_PROD_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT
-    WHERE CURRENT_RECORD_INDICATOR='Y' AND PARAM_NAME NOT IN ('BUSINESS_DATE','SMOOTH')
-""")
-st.dataframe(df)
+query = """
+    SELECT * 
+    FROM ACT_PROD_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT
+    WHERE CURRENT_RECORD_INDICATOR='Y' 
+    AND PARAM_NAME NOT IN ('BUSINESS_DATE','SMOOTH')
+"""
+df = fetch_data(query)
 
-role = get_user_role()
-user = get_snowflake_user()
+if df.empty:
+    st.warning("No data found!")
+else:
+    st.dataframe(df)
 
-if role == 'ACCOUNTADMIN':
-    df_approve = fetch_data("SELECT * FROM ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT_APPROVE")
-    st.dataframe(df_approve)
+# --- Check User Role ---
+user_role = get_user_role()
+snowflake_user = get_snowflake_user()
 
-    if st.button('Approve'):
-        conn = get_snowflake_connection()
-        if conn:
-            cursor = conn.cursor()
-            for _, row in df_approve.iterrows():
+st.write(f"**Logged in as:** {snowflake_user}  \n**Role:** {user_role}")
+
+# --- Role-Based Actions ---
+if user_role == 'ACCOUNTADMIN':
+    st.subheader("Admin Approval Section")
+    
+    approve_query = "SELECT * FROM ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT_APPROVE"
+    df_approve = fetch_data(approve_query)
+
+    if df_approve.empty:
+        st.info("No pending approvals.")
+    else:
+        st.dataframe(df_approve)
+
+        if st.button("Approve Changes"):
+            conn = get_snowflake_connection()
+            if conn:
+                cursor = conn.cursor()
                 try:
-                    cursor.execute(f"""
+                    for _, row in df_approve.iterrows():
+                        # Update main table
+                        update_query = f"""
                         UPDATE ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT
                         SET PARAM_VALUE = '{row['PARAM_VALUE']}', STATUS = 'Approved'
                         WHERE PARAM_NAME = '{row['PARAM_NAME']}'
-                    """)
-                    cursor.execute(f"""
+                        """
+                        cursor.execute(update_query)
+
+                        # Log history
+                        history_query = f"""
                         INSERT INTO ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_HISTORY 
                         (PARAM_NAME, OLD_VALUE, NEW_VALUE, EDITED_BY, EDITED_TIMESTAMP, APPROVED_BY, APPROVED_TIMESTAMP)
-                        VALUES ('{row['PARAM_NAME']}', '{row['OLD_VALUE']}', '{row['PARAM_VALUE']}', '{row['EDITED_BY']}', '{row['EDITED_TIMESTAMP']}', '{user}', CURRENT_TIMESTAMP())
-                    """)
-                    cursor.execute(f"""
-                        DELETE FROM ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT_APPROVE
-                        WHERE PARAM_NAME = '{row['PARAM_NAME']}'
-                    """)
+                        VALUES ('{row['PARAM_NAME']}', '{row['OLD_VALUE']}', '{row['PARAM_VALUE']}', 
+                                '{row['EDITED_BY']}', '{row['EDITED_TIMESTAMP']}', '{snowflake_user}', CURRENT_TIMESTAMP())
+                        """
+                        cursor.execute(history_query)
+
+                        # Remove approved record from approval table
+                        delete_query = f"DELETE FROM ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT_APPROVE WHERE PARAM_NAME = '{row['PARAM_NAME']}'"
+                        cursor.execute(delete_query)
+
+                    conn.commit()
+                    st.success("Changes approved successfully!")
                 except Exception as e:
                     st.error(f"Error during approval: {e}")
-            conn.commit()
-            cursor.close()
-            conn.close()
-            st.success("Changes approved!")
+                finally:
+                    cursor.close()
+                    conn.close()
 
-elif role == 'ACT_DEV_DISCOUNTRATE_DB_USER_ROLE':
-    edited_data = {}
-    for _, row in df.iterrows():
-        edited_data[row['PARAM_NAME']] = st.text_input(f"Edit {row['PARAM_NAME']}", value=row['PARAM_VALUE'])
+elif user_role == 'ACT_DEV_DISCOUNTRATE_DB_USER_ROLE':
+    st.subheader("User Edit Section")
 
-    if st.button('Save'):
-        conn = get_snowflake_connection()
-        if conn:
-            cursor = conn.cursor()
-            for param_name, new_value in edited_data.items():
+    if df.empty:
+        st.warning("No data available for editing.")
+    else:
+        edited_data = {}
+
+        for index, row in df.iterrows():
+            edited_value = st.text_input(f"Edit {row['PARAM_NAME']}", value=row['PARAM_VALUE'])
+            edited_data[row['PARAM_NAME']] = edited_value
+
+        if st.button("Save Changes"):
+            conn = get_snowflake_connection()
+            if conn:
+                cursor = conn.cursor()
                 try:
-                    old_value_df = fetch_data(f"SELECT PARAM_VALUE FROM ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT WHERE PARAM_NAME = '{param_name}'")
-                    old_value = old_value_df.iloc[0, 0] if not old_value_df.empty else None
-                    cursor.execute(f"""
-                        INSERT INTO ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT_APPROVE
+                    for param_name, new_value in edited_data.items():
+                        # Get the old value
+                        old_value_query = f"SELECT PARAM_VALUE FROM ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT WHERE PARAM_NAME = '{param_name}'"
+                        cursor.execute(old_value_query)
+                        old_value_result = cursor.fetchone()
+                        old_value = old_value_result[0] if old_value_result else None
+
+                        # Add to approval table
+                        insert_approve_query = f"""
+                        INSERT INTO ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT_APPROVE 
                         (PARAM_NAME, OLD_VALUE, PARAM_VALUE, EDITED_BY, EDITED_TIMESTAMP)
-                        VALUES ('{param_name}', '{old_value}', '{new_value}', '{user}', CURRENT_TIMESTAMP())
-                    """)
+                        VALUES ('{param_name}', '{old_value}', '{new_value}', '{snowflake_user}', CURRENT_TIMESTAMP())
+                        """
+                        cursor.execute(insert_approve_query)
+
+                    conn.commit()
+                    st.success("Changes submitted for approval!")
                 except Exception as e:
-                    st.error(f"Error saving data: {e}")
-            conn.commit()
-            cursor.close()
-            conn.close()
-            st.success("Changes submitted for approval!")
+                    st.error(f"Error saving changes: {e}")
+                finally:
+                    cursor.close()
+                    conn.close()
+else:
+    st.warning("You do not have permission to edit or approve data.")
+
