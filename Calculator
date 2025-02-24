@@ -1,9 +1,10 @@
 import streamlit as st
 import snowflake.connector
 import pandas as pd
-from datetime import datetime
 
-# Initialize connection. Use secrets for credentials.
+# --- Snowflake Connection Setup ---
+# This section connects your Streamlit app to your Snowflake database.
+# It uses information stored securely in your Streamlit secrets.
 try:
     sf_user = st.secrets["snowflake"]["user"]
     sf_password = st.secrets["snowflake"]["password"]
@@ -22,65 +23,113 @@ try:
     )
     cursor = conn.cursor()
 except Exception as e:
+    # If there's a problem connecting, show an error message.
     st.error(f"Error connecting to Snowflake: {e}")
 
-#Building ("Calculator")
-st.title("Smith-Wilson UFR Finder:chart_with_upwards_trend:")
-
-# Fetch data from snowflake for landing page
+# --- Display Data from Snowflake ---
+# This section fetches data from your Snowflake table and displays it in a table.
 try:
-    query = """
-    SELECT * FROM ACT_PROD_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT
-    WHERE CURRENT_RECORD_INDICATOR='Y'
-    AND PARAM_NAME NOT IN ('BUSINESS_DATE','SMOOTH' )
-    """
-    cursor.execute(query)
-    data = cursor.fetchall()
-    columns = [desc[0] for desc in cursor.description]
-    df = pd.DataFrame(data, columns=columns)
-    st.dataframe(df)
+    # The SQL query to get data from your table.
+    query = "SELECT * FROM ACT_PROD_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT WHERE CURRENT_RECORD_INDICATOR='Y' AND PARAM_NAME NOT IN ('BUSINESS_DATE','SMOOTH' )"
+    cursor.execute(query)  # Run the query.
+    data = cursor.fetchall()  # Get all the results.
+    columns = [desc[0] for desc in cursor.description]  # Get the column names.
+    df = pd.DataFrame(data, columns=columns)  # Put the data into a table (DataFrame).
+    st.dataframe(df)  # Show the table in your Streamlit app.
 except Exception as e:
+    # If there's a problem getting data, show an error message.
     st.error(f"Error fetching data: {e}")
 
-# Approve & Edit Functionality
+# --- Get User Role ---
+# This function figures out the user's role in Snowflake.
 def get_user_role():
     try:
-        cursor.execute("SELECT CURRENT_ROLE()")
-        role_tuple = cursor.fetchone()
+        # Re-establish connection, because the prior cursor was closed.
+        conn = snowflake.connector.connect(
+            user=sf_user,
+            password=sf_password,
+            account=sf_account,
+            warehouse=sf_warehouse,
+            database=sf_database,
+            schema=sf_schema
+        )
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT CURRENT_ROLE()")  # Run the query to get the role.
+        role_tuple = cursor.fetchone()  # Get the result.
+        cursor.close()
+        conn.close()
+
         if role_tuple and role_tuple[0]:
-            return role_tuple[0]
+            return role_tuple[0]  # Return the role name.
         else:
-            return None
+            return None  # Return None if no role is found.
     except Exception as e:
         st.error(f"Error fetching user role: {str(e)}")
         return None
 
+# --- Get Snowflake User ---
+#This function gets the current snowflake user.
 def get_snowflake_user():
     try:
-        cursor.execute("SELECT CURRENT_USER()")
-        user_tuple = cursor.fetchone()
+        conn = snowflake.connector.connect(
+            user=sf_user,
+            password=sf_password,
+            account=sf_account,
+            warehouse=sf_warehouse,
+            database=sf_database,
+            schema=sf_schema
+        )
+        cursor = conn.cursor()
+        cursor.execute("SELECT CURRENT_USER()")  # Run the query to get the user.
+        user_tuple = cursor.fetchone()  # Get the result.
+        cursor.close()
+        conn.close()
+
         if user_tuple and user_tuple[0]:
-            return user_tuple[0]
+            return user_tuple[0]  # Return the user name.
         else:
-            return None
+            return None  # Return None if no user is found.
     except Exception as e:
         st.error(f"Error fetching snowflake user: {str(e)}")
         return None
 
+# --- Show Buttons Based on User Role ---
+# This function shows different buttons depending on the user's role.
 def show_buttons_based_on_role(role, user):
     if role == 'ACCOUNTADMIN':
+        # If the user is an admin, show the "Approve" button.
         try:
             query_approve = "SELECT * FROM ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT_APPROVE"
+            conn = snowflake.connector.connect(
+                user=sf_user,
+                password=sf_password,
+                account=sf_account,
+                warehouse=sf_warehouse,
+                database=sf_database,
+                schema=sf_schema)
+            cursor = conn.cursor()
             cursor.execute(query_approve)
             approve_data = cursor.fetchall()
             approve_columns = [desc[0] for desc in cursor.description]
             df_approve = pd.DataFrame(approve_data, columns=approve_columns)
             st.dataframe(df_approve)
+            cursor.close()
+            conn.close()
 
             if st.button('Approve'):
+                #If the admin clicks approve, run all this code.
+                conn = snowflake.connector.connect(
+                    user=sf_user,
+                    password=sf_password,
+                    account=sf_account,
+                    warehouse=sf_warehouse,
+                    database=sf_database,
+                    schema=sf_schema)
+                cursor = conn.cursor()
                 for index, row in df_approve.iterrows():
                     try:
-                        # Update main table
+                        # Update the main table with the approved changes.
                         update_query = f"""
                         UPDATE ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT
                         SET PARAM_VALUE = '{row['PARAM_VALUE']}', STATUS = 'Approved'
@@ -88,14 +137,14 @@ def show_buttons_based_on_role(role, user):
                         """
                         cursor.execute(update_query)
 
-                        # Insert into history table
+                        # Add a record to the history table.
                         history_query = f"""
                         INSERT INTO ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_HISTORY (PARAM_NAME, OLD_VALUE, NEW_VALUE, EDITED_BY, EDITED_TIMESTAMP, APPROVED_BY, APPROVED_TIMESTAMP)
                         VALUES ('{row['PARAM_NAME']}', '{row['OLD_VALUE']}', '{row['PARAM_VALUE']}', '{row['EDITED_BY']}', '{row['EDITED_TIMESTAMP']}', '{user}', CURRENT_TIMESTAMP())
                         """
                         cursor.execute(history_query)
 
-                        # Remove from approve table
+                        # Remove the approved record from the approval table.
                         delete_query = f"""
                         DELETE FROM ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT_APPROVE
                         WHERE PARAM_NAME = '{row['PARAM_NAME']}'
@@ -105,50 +154,36 @@ def show_buttons_based_on_role(role, user):
                     except Exception as e:
                         st.error(f"Error during approval: {e}")
                 st.success("Changes approved!")
+                cursor.close()
+                conn.close()
         except Exception as e:
             st.error(f"Error fetching approve data: {e}")
 
     if role == 'ACT_DEV_DISCOUNTRATE_DB_USER_ROLE':
+        # If the user is a regular user, show the "Edit" button and input fields.
         edited_data = {}
         for index, row in df.iterrows():
             edited_value = st.text_input(f"Edit {row['PARAM_NAME']}", value=row['PARAM_VALUE'])
             edited_data[row['PARAM_NAME']] = edited_value
 
         if st.button('Save'):
+            conn = snowflake.connector.connect(
+                user=sf_user,
+                password=sf_password,
+                account=sf_account,
+                warehouse=sf_warehouse,
+                database=sf_database,
+                schema=sf_schema)
+            cursor = conn.cursor()
             for param_name, new_value in edited_data.items():
                 try:
+                    #Get the old value.
                     old_value_query = f"SELECT PARAM_VALUE FROM ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT WHERE PARAM_NAME = '{param_name}'"
                     cursor.execute(old_value_query)
                     old_value_result = cursor.fetchone()
                     old_value = old_value_result[0] if old_value_result else None
 
+                    # Add the edited record to the approval table.
                     insert_approve_query = f"""
                     INSERT INTO ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT_APPROVE (PARAM_NAME, OLD_VALUE, PARAM_VALUE, EDITED_BY, EDITED_TIMESTAMP)
-                    VALUES ('{param_name}', '{old_value}', '{new_value}', '{user}', CURRENT_TIMESTAMP())
-                    """
-                    cursor.execute(insert_approve_query)
-
-                    update_status_query = f"""
-                    UPDATE ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT
-                    SET STATUS = 'Pending'
-                    WHERE PARAM_NAME = '{param_name}'
-                    """
-                    cursor.execute(update_status_query)
-
-                    conn.commit()
-                except Exception as e:
-                    st.error(f"Error saving changes: {e}")
-            st.success("Changes saved for approval!")
-
-user_role = get_user_role()
-snowflake_user = get_snowflake_user()
-
-if user_role:
-    st.write(f'Logged in with role: {user_role}')
-    show_buttons_based_on_role(user_role, snowflake_user)
-
-# Close connection
-if 'cursor' in locals() and cursor:
-    cursor.close()
-if 'conn' in locals() and conn:
-    conn.close()
+                    VALUES ('{param_name}', '{old_value
