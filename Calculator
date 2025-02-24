@@ -1,33 +1,154 @@
-User role: 
+import streamlit as st
+import snowflake.connector
+import pandas as pd
+from datetime import datetime
 
-User have to be able to view the landing page with current set of data from the table. They will only see the “Edit” option. They can edit the UFR data and save it using a save button. 
+# Initialize connection. Use secrets for credentials.
+try:
+    sf_user = st.secrets["snowflake"]["user"]
+    sf_password = st.secrets["snowflake"]["password"]
+    sf_account = st.secrets["snowflake"]["account"]
+    sf_warehouse = st.secrets["snowflake"]["warehouse"]
+    sf_database = st.secrets["snowflake"]["database"]
+    sf_schema = st.secrets["snowflake"]["schema"]
 
-When the user changes a record, it shouldn’t go directly into the main table. It will be inserted into the ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT_APPROVE table. No data in the ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT table will be updated by the user changes. 
+    conn = snowflake.connector.connect(
+        user=sf_user,
+        password=sf_password,
+        account=sf_account,
+        warehouse=sf_warehouse,
+        database=sf_database,
+        schema=sf_schema
+    )
+    cursor = conn.cursor()
+except Exception as e:
+    st.error(f"Error connecting to Snowflake: {e}")
 
+#Building ("Calculator")
+st.title("Smith-Wilson UFR Finder:chart_with_upwards_trend:")
 
+# Fetch data from snowflake for landing page
+try:
+    query = """
+    SELECT * FROM ACT_PROD_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT
+    WHERE CURRENT_RECORD_INDICATOR='Y'
+    AND PARAM_NAME NOT IN ('BUSINESS_DATE','SMOOTH' )
+    """
+    cursor.execute(query)
+    data = cursor.fetchall()
+    columns = [desc[0] for desc in cursor.description]
+    df = pd.DataFrame(data, columns=columns)
+    st.dataframe(df)
+except Exception as e:
+    st.error(f"Error fetching data: {e}")
 
-Manager  role: 
+# Approve & Edit Functionality
+def get_user_role():
+    try:
+        cursor.execute("SELECT CURRENT_ROLE()")
+        role_tuple = cursor.fetchone()
+        if role_tuple and role_tuple[0]:
+            return role_tuple[0]
+        else:
+            return None
+    except Exception as e:
+        st.error(f"Error fetching user role: {str(e)}")
+        return None
 
-Managers when they login will only see the “Approve” option
+def get_snowflake_user():
+    try:
+        cursor.execute("SELECT CURRENT_USER()")
+        user_tuple = cursor.fetchone()
+        if user_tuple and user_tuple[0]:
+            return user_tuple[0]
+        else:
+            return None
+    except Exception as e:
+        st.error(f"Error fetching snowflake user: {str(e)}")
+        return None
 
-Manager role when they login will be shown the data from  ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT_APPROVE  along with the old values from ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT . 
+def show_buttons_based_on_role(role, user):
+    if role == 'ACCOUNTADMIN':
+        try:
+            query_approve = "SELECT * FROM ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT_APPROVE"
+            cursor.execute(query_approve)
+            approve_data = cursor.fetchall()
+            approve_columns = [desc[0] for desc in cursor.description]
+            df_approve = pd.DataFrame(approve_data, columns=approve_columns)
+            st.dataframe(df_approve)
 
-Manager has to approve changes to UFR. 
+            if st.button('Approve'):
+                for index, row in df_approve.iterrows():
+                    try:
+                        # Update main table
+                        update_query = f"""
+                        UPDATE ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT
+                        SET PARAM_VALUE = '{row['PARAM_VALUE']}', STATUS = 'Approved'
+                        WHERE PARAM_NAME = '{row['PARAM_NAME']}'
+                        """
+                        cursor.execute(update_query)
 
-When a manager approves the changes, the data from the _APPROVE table will be updated to the main table, and removed from the _APPROVE table.
+                        # Insert into history table
+                        history_query = f"""
+                        INSERT INTO ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_HISTORY (PARAM_NAME, OLD_VALUE, NEW_VALUE, EDITED_BY, EDITED_TIMESTAMP, APPROVED_BY, APPROVED_TIMESTAMP)
+                        VALUES ('{row['PARAM_NAME']}', '{row['OLD_VALUE']}', '{row['PARAM_VALUE']}', '{row['EDITED_BY']}', '{row['EDITED_TIMESTAMP']}', '{user}', CURRENT_TIMESTAMP())
+                        """
+                        cursor.execute(history_query)
 
+                        # Remove from approve table
+                        delete_query = f"""
+                        DELETE FROM ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT_APPROVE
+                        WHERE PARAM_NAME = '{row['PARAM_NAME']}'
+                        """
+                        cursor.execute(delete_query)
+                        conn.commit()
+                    except Exception as e:
+                        st.error(f"Error during approval: {e}")
+                st.success("Changes approved!")
+        except Exception as e:
+            st.error(f"Error fetching approve data: {e}")
 
-Functional requiments 3
+    if role == 'ACT_DEV_DISCOUNTRATE_DB_USER_ROLE':
+        edited_data = {}
+        for index, row in df.iterrows():
+            edited_value = st.text_input(f"Edit {row['PARAM_NAME']}", value=row['PARAM_VALUE'])
+            edited_data[row['PARAM_NAME']] = edited_value
 
-All transaction should be captured in a history  table ( previous version, when /who update /approve the changes). A new record will be inserted into this table when a user edits a record. The record will have the current and new values , the user id of who is performing the edit, date and time of edit. When a manager approves a record this record will be updated with the user id of the manager who approved it and date and time of approval 
+        if st.button('Save'):
+            for param_name, new_value in edited_data.items():
+                try:
+                    old_value_query = f"SELECT PARAM_VALUE FROM ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT WHERE PARAM_NAME = '{param_name}'"
+                    cursor.execute(old_value_query)
+                    old_value_result = cursor.fetchone()
+                    old_value = old_value_result[0] if old_value_result else None
 
-In addition there has to be a new “STATUS” column in ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT table that indicates whetehr the user has saved any edited changes pending
+                    insert_approve_query = f"""
+                    INSERT INTO ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT_APPROVE (PARAM_NAME, OLD_VALUE, PARAM_VALUE, EDITED_BY, EDITED_TIMESTAMP)
+                    VALUES ('{param_name}', '{old_value}', '{new_value}', '{user}', CURRENT_TIMESTAMP())
+                    """
+                    cursor.execute(insert_approve_query)
 
+                    update_status_query = f"""
+                    UPDATE ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT
+                    SET STATUS = 'Pending'
+                    WHERE PARAM_NAME = '{param_name}'
+                    """
+                    cursor.execute(update_status_query)
 
-Query to be used for displaying landing page
+                    conn.commit()
+                except Exception as e:
+                    st.error(f"Error saving changes: {e}")
+            st.success("Changes saved for approval!")
 
-select * from ACT_PROD_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT
-WHERE CURRENT_RECORD_INDICATOR='Y'
-AND PARAM_NAME NOT IN ('BUSINESS_DATE','SMOOTH' )
+user_role = get_user_role()
+snowflake_user = get_snowflake_user()
 
+if user_role:
+    st.write(f'Logged in with role: {user_role}')
+    show_buttons_based_on_role(user_role, snowflake_user)
 
+# Close connection
+if 'cursor' in locals() and cursor:
+    cursor.close()
+if 'conn' in locals() and conn:
+    conn.close()
