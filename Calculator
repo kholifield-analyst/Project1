@@ -1,73 +1,33 @@
-import streamlit as st
-import snowflake.connector
-import pandas as pd
+User role: 
 
-sf_user = st.secrets["snowflake"]["user"]
-sf_password = st.secrets["snowflake"]["password"]
-sf_account = st.secrets["snowflake"]["account"]
-sf_warehouse = st.secrets["snowflake"]["warehouse"]
-sf_database = st.secrets["snowflake"]["database"]
-sf_schema = st.secrets["snowflake"]["schema"]
+User have to be able to view the landing page with current set of data from the table. They will only see the “Edit” option. They can edit the UFR data and save it using a save button. 
 
-conn = snowflake.connector.connect(
-    user=sf_user,
-    password=sf_password,
-    account=sf_account,
-    warehouse=sf_warehouse,
-    database=sf_database,
-    schema=sf_schema)
-#Get Data from snowflake
-cursor = conn.cursor()
-query = "SELECT * FROM ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT limit 23;"
-cursor.execute(query)
-
-data = cursor.fetchall()
+When the user changes a record, it shouldn’t go directly into the main table. It will be inserted into the ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT_APPROVE table. No data in the ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT table will be updated by the user changes. 
 
 
-cursor.close()
-conn.close()
 
-#Building ("Calculator")
-st.title("Smith-Wilson UFR Finder:chart_with_upwards_trend:")
-columns = [desc[0] for desc in cursor.description]
-df = pd.DataFrame(data, columns=columns)
-st.dataframe(df)
+Manager  role: 
 
-#Approve & Edit
+Managers when they login will only see the “Approve” option
 
-def get_user_role():
-    try:
-        conn = snowflake.connector.connect(
-            user=sf_user,
-    password=sf_password,
-    account=sf_account,
-    warehouse=sf_warehouse,
-    database=sf_database,
-    schema=sf_schema)
-        
-        cursor = conn.cursor()
-        cursor.execute("SELECT CURRENT_ROLE()")
-        role_tuple = cursor.fetchone()
-        cursor.close()
-        conn.close()
-        if role_tuple and role_tuple[0]:
-            return role_tuple[0]
-        else:
-            return None
-    
-    except Exception as e:
-        st.error(f"Error fetching user role: {str(e)}")
-        return None
-    
-def show_buttons_based_on_role(role):
-    if role == 'ACCOUNTADMIN':
-        approve_button = st.button('Approve')
-        
+Manager role when they login will be shown the data from  ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT_APPROVE  along with the old values from ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT . 
 
-    if role == 'ACT_DEV_DISCOUNTRATE_DB_USER_ROLE':
-            edit_button = st.button('Edit:pencil:')
+Manager has to approve changes to UFR. 
 
-user_role = get_user_role()
-if user_role:
-    st.write(f'Logged in with role: {user_role}')
-    show_buttons_based_on_role(user_role)
+When a manager approves the changes, the data from the _APPROVE table will be updated to the main table, and removed from the _APPROVE table.
+
+
+Functional requiments 3
+
+All transaction should be captured in a history  table ( previous version, when /who update /approve the changes). A new record will be inserted into this table when a user edits a record. The record will have the current and new values , the user id of who is performing the edit, date and time of edit. When a manager approves a record this record will be updated with the user id of the manager who approved it and date and time of approval 
+
+In addition there has to be a new “STATUS” column in ACT_DEV_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT table that indicates whetehr the user has saved any edited changes pending
+
+
+Query to be used for displaying landing page
+
+select * from ACT_PROD_DISCOUNTRATE_DB.WORKSPACE.DR_USER_INPUT
+WHERE CURRENT_RECORD_INDICATOR='Y'
+AND PARAM_NAME NOT IN ('BUSINESS_DATE','SMOOTH' )
+
+
